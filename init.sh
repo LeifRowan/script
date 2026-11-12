@@ -18,7 +18,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly STATE_DIR="/etc/server-init"
 readonly STATE_FILE="${STATE_DIR}/state.env"
 readonly LOG_FILE="/var/log/server-init.log"
@@ -29,6 +29,8 @@ readonly UFW_AFTER_RULES="/etc/ufw/after.rules"
 readonly DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 readonly SWAP_FILE="/swapfile"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-server-init.conf"
+readonly SYSCTL_NET_FILE="/etc/sysctl.d/99-server-init-net.conf"
+readonly MODULES_LOAD_NET="/etc/modules-load.d/server-init-net.conf"
 readonly JOURNALD_DROPIN="/etc/systemd/journald.conf.d/00-server-init.conf"
 readonly BASHRC_SHARED="${STATE_DIR}/bashrc.sh"
 readonly VIMRC_SHARED="${STATE_DIR}/vimrc.vim"
@@ -45,7 +47,7 @@ export NEEDRESTART_SUSPEND=1
 readonly KNOWN_KEYS=(
   NONINTERACTIVE FORCE
   ENABLE_UPDATE ENABLE_BASELINE ENABLE_PACKAGES ENABLE_USER ENABLE_SSH
-  ENABLE_UFW ENABLE_FAIL2BAN ENABLE_DOCKER ENABLE_SWAP ENABLE_SHELL_ENV
+  ENABLE_UFW ENABLE_FAIL2BAN ENABLE_DOCKER ENABLE_SWAP ENABLE_NET ENABLE_SHELL_ENV
   TIMEZONE JOURNALD_MAX_USE
   PACKAGE_PROFILE EXTRA_PACKAGES
   NEW_USER USER_PASSWORD USER_PASSWORD_HASH USER_SUDO USER_SUDO_NOPASSWD
@@ -55,6 +57,7 @@ readonly KNOWN_KEYS=(
   F2B_MAXRETRY F2B_FINDTIME F2B_BANTIME F2B_BANTIME_MAX
   DOCKER_USER_GROUP DOCKER_LOG_MAX_SIZE DOCKER_LOG_MAX_FILE
   SWAP_SIZE SWAPPINESS
+  TCP_CONGESTION TCP_QDISC TCP_WINDOW_MAX TCP_BANDWIDTH TCP_RTT_MS
   SHELL_ENV_SCOPE SHELL_ENV_USERS
   AUTO_REBOOT
 )
@@ -316,6 +319,84 @@ size_to_mb() {
   esac
 }
 
+# 把 "64K" / "16M" / "1G" / 纯数字 转成字节
+size_to_bytes() {
+  local s=${1^^}
+  case $s in
+    *G) echo $(( 10#${s%G} * 1024 * 1024 * 1024 )) ;;
+    *M) echo $(( 10#${s%M} * 1024 * 1024 )) ;;
+    *K) echo $(( 10#${s%K} * 1024 )) ;;
+    *)  echo $(( 10#$s )) ;;
+  esac
+}
+
+bytes_human() {
+  local b=$1
+  if (( b % 1048576 == 0 )); then
+    echo "$(( b / 1048576 ))M"
+  elif (( b % 1024 == 0 )); then
+    echo "$(( b / 1024 ))K"
+  else
+    echo "$b"
+  fi
+}
+
+# 100Mbit / 1Gbit / 纯数字 (bit/s)。用十进制, 和网卡 speed 的 Mbps 一致
+parse_bandwidth_bps() {
+  local s=${1^^} n
+  s=${s//[[:space:]]/}
+  if [[ $s =~ ^([0-9]{1,6})(GBIT|GBPS|MBIT|MBPS|KBIT|KBPS)$ ]]; then
+    n=$(( 10#${BASH_REMATCH[1]} ))
+    case ${BASH_REMATCH[2]} in
+      GBIT|GBPS) echo $(( n * 1000000000 )) ;;
+      MBIT|MBPS) echo $(( n * 1000000 )) ;;
+      KBIT|KBPS) echo $(( n * 1000 )) ;;
+    esac
+    return 0
+  fi
+  if [[ $s =~ ^[0-9]{1,15}$ ]]; then
+    echo $(( 10#$s ))
+    return 0
+  fi
+  return 1
+}
+
+bits_human() {
+  local b=$1
+  if (( b % 1000000000 == 0 )); then echo "$(( b / 1000000000 ))Gbit"
+  elif (( b % 1000000 == 0 )); then echo "$(( b / 1000000 ))Mbit"
+  elif (( b % 1000 == 0 )); then echo "$(( b / 1000 ))Kbit"
+  else echo "${b}bit"
+  fi
+}
+
+# 单连接缓冲上限 (字节) = 2 × 带宽 × RTT。
+# 线上要填满管道需要一个 BDP (带宽×延迟); 套接字缓冲含协议开销, 要大于在途数据,
+# 窗口才真能涨到这个 BDP, 所以取 2 倍。内存不参与这个乘法, 只在后面封顶。
+# 输出一行: "<字节> <0|1 是否封顶> <封顶前字节>"
+tcp_window_bytes() {
+  local bps=$1 rtt_ms=$2 mem_quarter=$3 raw unclamped limit hard=$(( 128 * 1024 * 1024 ))
+  raw=$(( bps / 4000 * rtt_ms + (bps % 4000) * rtt_ms / 4000 ))
+  (( raw < 1 )) && raw=1
+  if (( raw >= 1048576 )); then
+    raw=$(( (raw + 1048576 - 1) / 1048576 * 1048576 ))
+  else
+    raw=$(( (raw + 65536 - 1) / 65536 * 65536 ))
+  fi
+  unclamped=$raw
+  limit=$mem_quarter
+  (( limit > hard )) && limit=$hard
+  (( limit < 65536 )) && limit=65536
+  if (( raw > limit )); then
+    raw=$limit
+    (( raw >= 1048576 )) && raw=$(( raw / 1048576 * 1048576 ))
+    (( raw < 65536 )) && raw=65536
+    echo "$raw 1 $unclamped"
+  else
+    echo "$raw 0 $unclamped"
+  fi
+}
+
 # ssh 公钥校验 (ssh-keygen -l 能解析才算合法)
 # 不接受 ssh-dss: OpenSSH 7.0 起默认禁用, 10.0 (Debian 13) 已移除, 算作有效会导致锁定后无法登录。
 # RSA 小于 1024 位会被 sshd (RequiredRSASize) 拒绝, 同样不算有效
@@ -561,6 +642,27 @@ select_modules() {
     m=${MODULES[$((n - 1))]}
     printf -v "ENABLE_${m%%|*}" no
   done
+}
+
+# 网络优化不进上面的模块列表。那个列表默认全开, 只能填编号关闭。
+# 这里单独问, 默认关。配置或环境变量里写了 ENABLE_NET 时, 菜单里的初始状态跟配置走。
+select_net() {
+  if ! is_set ENABLE_NET; then
+    ENABLE_NET=no
+  fi
+  norm_yn ENABLE_NET
+  (( INTERACTIVE )) || return 0
+
+  step "网络优化 (默认关闭)"
+  local flag="[ ]" choice=""
+  [[ $ENABLE_NET == yes ]] && flag="[x]"
+  tty_print "  1) ${flag} BBR + fq + TCP 窗口"$'\n'
+  ask choice "输入 1 切换开关, 回车保持上面的状态" ""
+  if [[ $choice == 1 ]]; then
+    if [[ $ENABLE_NET == yes ]]; then ENABLE_NET=no; else ENABLE_NET=yes; fi
+  elif [[ -n $choice ]]; then
+    warn "忽略无效输入: ${choice}, 网络优化保持$( [[ $ENABLE_NET == yes ]] && echo 开启 || echo 关闭 )"
+  fi
 }
 
 collect_baseline() {
@@ -975,6 +1077,160 @@ collect_swap() {
   fi
 }
 
+# 默认路由使用的网卡。窗口要填的是这台服务器的上行, 不是本机开发机
+default_route_iface() {
+  command -v ip >/dev/null 2>&1 || return 0
+  local iface=""
+  iface=$(ip -4 route show default 2>/dev/null \
+    | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)
+  if [[ -z $iface ]]; then
+    iface=$(ip -6 route show default 2>/dev/null \
+      | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)
+  fi
+  printf '%s' "${iface%%@*}"
+}
+
+# /sys/class/net/<if>/speed 单位是 Mbit/s。虚拟网卡经常是 -1
+nic_speed_mbps() {
+  local iface=$1 speed
+  [[ -n $iface && -r /sys/class/net/${iface}/speed ]] || return 1
+  speed=$(cat "/sys/class/net/${iface}/speed" 2>/dev/null || true)
+  [[ $speed =~ ^[0-9]+$ ]] || return 1
+  (( speed >= 1 && speed <= 400000 )) || return 1
+  echo "$speed"
+}
+
+# 当前 SSH 会话的 RTT (毫秒, 向上取整)。没有 SSH 会话时不输出。
+# 这只是一条已经存在的路径, 不能代表所有客户端
+ssh_rtt_ms() {
+  local peer line whole frac rtt max=0
+  command -v ss >/dev/null 2>&1 || return 0
+  while IFS= read -r peer; do
+    [[ -n $peer ]] || continue
+    while IFS= read -r line; do
+      if [[ $line =~ rtt:([0-9]+)\.([0-9]+) ]]; then
+        whole=${BASH_REMATCH[1]}
+        frac=${BASH_REMATCH[2]}
+      elif [[ $line =~ rtt:([0-9]+) ]]; then
+        whole=${BASH_REMATCH[1]}
+        frac=""
+      else
+        continue
+      fi
+      rtt=$whole
+      [[ -n $frac && $frac =~ [^0] ]] && rtt=$(( whole + 1 ))
+      (( rtt > max )) && max=$rtt
+    done < <(ss -ti "dst ${peer}" 2>/dev/null || true)
+  done < <(ssh_peer_ips || true)
+  (( max > 0 )) && echo "$max"
+}
+
+bandwidth_in_range() {
+  [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 10000 && $1 <= 400000000000 ))
+}
+
+resolve_tcp_bandwidth() {
+  local iface="" speed=""
+  TCP_BANDWIDTH_SRC=""
+  if ! is_set TCP_BANDWIDTH || [[ -z $TCP_BANDWIDTH || ${TCP_BANDWIDTH,,} == auto ]]; then
+    iface=$(default_route_iface)
+    if speed=$(nic_speed_mbps "$iface"); then
+      TCP_BANDWIDTH_BPS=$(( speed * 1000000 ))
+      TCP_BANDWIDTH_SRC="网卡 ${iface} 报告 ${speed}Mbit"
+      (( speed >= 10000 )) && TCP_BANDWIDTH_SRC+=", 虚拟网卡经常虚报, 厂商有限速请设 TCP_BANDWIDTH"
+      return 0
+    fi
+    if (( INTERACTIVE )); then
+      warn "网卡 ${iface:-无默认路由} 没有报告速率"
+      while true; do
+        ask TCP_BANDWIDTH "上行带宽 (如 100Mbit / 1Gbit)" "1Gbit"
+        TCP_BANDWIDTH_BPS=$(parse_bandwidth_bps "$TCP_BANDWIDTH" || true)
+        if bandwidth_in_range "$TCP_BANDWIDTH_BPS"; then
+          TCP_BANDWIDTH_SRC="手动指定 ${TCP_BANDWIDTH}"
+          return 0
+        fi
+        warn "带宽格式错误: ${TCP_BANDWIDTH} (如 100Mbit / 1Gbit, 范围 10Kbit-400Gbit)"
+        unset TCP_BANDWIDTH
+      done
+    fi
+    warn "网卡速率未知, 按 1Gbit 计算。不是这个带宽请设 TCP_BANDWIDTH"
+    TCP_BANDWIDTH_BPS=1000000000
+    TCP_BANDWIDTH_SRC="网卡速率未知, 按 1Gbit 假设"
+    return 0
+  fi
+  TCP_BANDWIDTH_BPS=$(parse_bandwidth_bps "$TCP_BANDWIDTH" || true)
+  bandwidth_in_range "$TCP_BANDWIDTH_BPS" \
+    || die "TCP_BANDWIDTH 格式错误或超出 10Kbit-400Gbit: ${TCP_BANDWIDTH} (如 100Mbit / 1Gbit)"
+  TCP_BANDWIDTH_SRC="配置 ${TCP_BANDWIDTH}"
+}
+
+# auto: 至少按 200ms 算, 让一条连接能填满跨区路径。
+# 不去 ping 公共 DNS: 那些地址是就近的, 测出来只有几毫秒, 窗口会被算得太小。
+# 当前 SSH 比 200ms 更差时改用实测, 避免把已经看到的长延迟忽略掉。
+resolve_tcp_rtt() {
+  local ssh_rtt="" floor=200
+  TCP_RTT_SRC=""
+  if ! is_set TCP_RTT_MS || [[ -z $TCP_RTT_MS || ${TCP_RTT_MS,,} == auto ]]; then
+    ssh_rtt=$(ssh_rtt_ms || true)
+    TCP_RTT_USED=$floor
+    if [[ $ssh_rtt =~ ^[0-9]+$ ]] && (( ssh_rtt > floor )); then
+      TCP_RTT_USED=$ssh_rtt
+      TCP_RTT_SRC="当前 SSH 延迟 ${ssh_rtt}ms, 高于 ${floor}ms, 按实测计算"
+    elif [[ $ssh_rtt =~ ^[0-9]+$ ]]; then
+      TCP_RTT_SRC="按 ${floor}ms 计算 (当前 SSH ${ssh_rtt}ms, 只代表这条连接)"
+    else
+      TCP_RTT_SRC="按 ${floor}ms 计算 (要覆盖的跨区延迟, 客户端更远或更近请设 TCP_RTT_MS)"
+    fi
+    return 0
+  fi
+  [[ $TCP_RTT_MS =~ ^[0-9]+$ ]] && (( TCP_RTT_MS >= 1 && TCP_RTT_MS <= 10000 )) \
+    || die "TCP_RTT_MS 必须是 1-10000 的毫秒数, 或 auto: ${TCP_RTT_MS}"
+  TCP_RTT_USED=$TCP_RTT_MS
+  TCP_RTT_SRC="配置 ${TCP_RTT_MS}ms"
+}
+
+collect_net() {
+  [[ $ENABLE_NET == yes ]] || return 0
+  is_set TCP_CONGESTION || TCP_CONGESTION=bbr
+  is_set TCP_QDISC || TCP_QDISC=fq
+  is_set TCP_WINDOW_MAX || TCP_WINDOW_MAX=auto
+  [[ $TCP_CONGESTION =~ ^[a-z][a-z0-9_]*$ ]] || die "TCP_CONGESTION 无效: ${TCP_CONGESTION}"
+  [[ $TCP_QDISC =~ ^[a-z][a-z0-9_]*$ ]] || die "TCP_QDISC 无效: ${TCP_QDISC}"
+
+  local mem_mb mem_quarter
+  mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+  (( mem_mb > 0 )) || die "读不到内存大小, 无法计算 TCP 窗口"
+  mem_quarter=$(( mem_mb * 1024 * 1024 / 4 ))
+
+  TCP_BANDWIDTH_SRC=""
+  TCP_RTT_SRC=""
+  if [[ ${TCP_WINDOW_MAX,,} != auto ]]; then
+    [[ ${TCP_WINDOW_MAX^^} =~ ^[0-9]{1,10}[KMG]?$ ]] \
+      || die "TCP_WINDOW_MAX 格式错误: ${TCP_WINDOW_MAX} (如 auto / 16M / 16777216)"
+    TCP_WINDOW_BYTES=$(size_to_bytes "$TCP_WINDOW_MAX")
+    (( TCP_WINDOW_BYTES >= 65536 )) || die "TCP_WINDOW_MAX 至少 64K: ${TCP_WINDOW_MAX}"
+    (( TCP_WINDOW_BYTES <= 128 * 1024 * 1024 )) || die "TCP_WINDOW_MAX 最大 128M: ${TCP_WINDOW_MAX}"
+    (( TCP_WINDOW_BYTES <= mem_quarter )) \
+      || die "TCP_WINDOW_MAX ${TCP_WINDOW_MAX} 超过内存的 1/4 (内存 ${mem_mb}MB)"
+    TCP_WINDOW_DESC="$(bytes_human "$TCP_WINDOW_BYTES") (手动指定)"
+    info "TCP 窗口上限: ${TCP_WINDOW_DESC}"
+    return 0
+  fi
+
+  resolve_tcp_bandwidth
+  resolve_tcp_rtt
+  read -r TCP_WINDOW_BYTES TCP_WINDOW_CAPPED TCP_WINDOW_RAW \
+    < <(tcp_window_bytes "$TCP_BANDWIDTH_BPS" "$TCP_RTT_USED" "$mem_quarter")
+  if (( TCP_WINDOW_CAPPED )); then
+    TCP_WINDOW_DESC="$(bytes_human "$TCP_WINDOW_BYTES") (带宽×延迟为 $(bytes_human "$TCP_WINDOW_RAW"), 已按内存 1/4 与 128M 封顶) = $(bits_human "$TCP_BANDWIDTH_BPS") x ${TCP_RTT_USED}ms x 2"
+  else
+    TCP_WINDOW_DESC="$(bytes_human "$TCP_WINDOW_BYTES") = $(bits_human "$TCP_BANDWIDTH_BPS") x ${TCP_RTT_USED}ms x 2"
+  fi
+  info "TCP 窗口上限: ${TCP_WINDOW_DESC}"
+  info "带宽: ${TCP_BANDWIDTH_SRC}"
+  info "延迟: ${TCP_RTT_SRC}"
+}
+
 collect_shell_env() {
   [[ $ENABLE_SHELL_ENV == yes ]] || return 0
   if ! is_set SHELL_ENV_SCOPE; then
@@ -1017,6 +1273,13 @@ show_plan() {
   fi
   [[ $ENABLE_FAIL2BAN == yes ]] && echo "  fail2ban: ${F2B_MAXRETRY} 次/${F2B_FINDTIME} 封 ${F2B_BANTIME}, 递增至 ${F2B_BANTIME_MAX}"
   [[ $ENABLE_SWAP == yes ]] && echo "  swap: ${SWAP_SIZE}, swappiness=${SWAPPINESS}"
+  if [[ $ENABLE_NET == yes ]]; then
+    echo "  网络: 拥塞控制 ${TCP_CONGESTION}, qdisc ${TCP_QDISC}, TCP 窗口上限 ${TCP_WINDOW_DESC}"
+    [[ -n ${TCP_BANDWIDTH_SRC:-} ]] && echo "       带宽: ${TCP_BANDWIDTH_SRC}"
+    [[ -n ${TCP_RTT_SRC:-} ]] && echo "       延迟: ${TCP_RTT_SRC}"
+  else
+    echo "  网络优化 (BBR + fq + TCP 窗口): 关闭"
+  fi
   if [[ $ENABLE_SHELL_ENV == yes ]]; then
     echo "  环境优化: $( [[ $SHELL_ENV_SCOPE == global ]] && echo '全部用户(含 root)' || echo "${SHELL_ENV_USERS}")"
   fi
@@ -1583,6 +1846,7 @@ do_swap() {
     backup_file /etc/fstab
     echo "${SWAP_FILE} none swap sw 0 0" >>/etc/fstab
   fi
+  # 网络参数在 SYSCTL_NET_FILE, 不要写进这个文件, 两个模块会互相覆盖
   write_file "$SYSCTL_FILE" 644 <<EOF || true
 # Managed by server-init
 vm.swappiness = ${SWAPPINESS}
@@ -1590,6 +1854,187 @@ EOF
   sysctl -q -p "$SYSCTL_FILE"
   ok "swap ${mb}MB 已启用, swappiness=${SWAPPINESS}"
   note "swap: ${mb}MB (${SWAP_FILE})"
+}
+
+# modprobe -n -v 对真正的模块打印 insmod, 对内建模块打印 builtin。
+# 内建模块写进 modules-load.d 会让每次开机都打一条警告。
+module_needs_load() {
+  local out
+  out=$(modprobe -n -v "$1" 2>/dev/null || true)
+  [[ $out == *insmod* ]]
+}
+
+# 网卡是否该改 qdisc: 跳过容器网卡; operstate=down 不动
+net_iface_tunable() {
+  local iface=$1 state flags
+  [[ $iface =~ ^(lo|veth|docker|br-|virbr|cali|flannel|cni|lxc|ifb|dummy|kube-) ]] && return 1
+  state=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || true)
+  [[ $state == down ]] && return 1
+  [[ $state == up ]] && return 0
+  flags=$(cat "/sys/class/net/${iface}/flags" 2>/dev/null || true)
+  [[ $flags =~ ^0x[0-9a-fA-F]+$ ]] || return 1
+  (( flags & 1 ))
+}
+
+# 只动默认队列。mq 只替换子队列, 不把多队列根换成单个 fq (那样会失去多队列)。
+# htb/cake 等整形队列一律保留。
+apply_net_qdisc() {
+  local qdisc=$1 iface root parent n
+  command -v tc >/dev/null 2>&1 || {
+    warn "没有 tc, 跳过当前网卡 qdisc (重启后 default_qdisc 对新网卡生效)"
+    return 0
+  }
+  while IFS= read -r iface; do
+    [[ -n $iface ]] || continue
+    net_iface_tunable "$iface" || continue
+    root=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2}' || true)
+    [[ -n $root ]] || continue
+    if [[ $root == "$qdisc" ]]; then
+      info "${iface}: qdisc 已是 ${qdisc}"
+      continue
+    fi
+    case $root in
+      mq|mqprio)
+        n=0
+        while IFS= read -r parent; do
+          [[ -n $parent ]] || continue
+          if tc qdisc replace dev "$iface" parent "$parent" "$qdisc" >/dev/null 2>&1; then
+            n=$((n + 1))
+          fi
+        done < <(tc qdisc show dev "$iface" 2>/dev/null \
+          | awk 'NR>1 { for (i=1;i<=NF;i++) if ($i=="parent") { print $(i+1); break } }' || true)
+        if (( n > 0 )); then
+          ok "${iface}: ${n} 个子队列已设为 ${qdisc}"
+        else
+          warn "${iface}: 多队列网卡未能立即切换 ${qdisc}, 重启后 default_qdisc 生效"
+        fi
+        ;;
+      fq_codel|pfifo_fast|pfifo|noqueue|fq_pie|pfifo_head_drop|fq)
+        if tc qdisc replace dev "$iface" root "$qdisc" >/dev/null 2>&1; then
+          ok "${iface}: qdisc ${root} -> ${qdisc}"
+        else
+          warn "${iface}: 切换到 ${qdisc} 失败, 重启后 default_qdisc 对新网卡生效"
+        fi
+        ;;
+      *)
+        warn "${iface}: 保留已有 qdisc ${root}"
+        ;;
+    esac
+  done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 || true)
+}
+
+net_sysctl_has() { sysctl -n "$1" >/dev/null 2>&1; }
+
+do_net() {
+  step "网络优化 (${TCP_CONGESTION} + ${TCP_QDISC} + TCP 窗口)"
+  command -v sysctl >/dev/null 2>&1 || apt_install procps
+  command -v tc >/dev/null 2>&1 || apt_install iproute2
+
+  local cc_ok=0 qdisc_ok=0 virt
+  virt=$(systemd-detect-virt -c 2>/dev/null || true)
+  if [[ -n $virt && $virt != none ]]; then
+    warn "运行在容器 (${virt}) 中, 网络 sysctl / qdisc 可能由宿主机决定"
+  fi
+
+  if modprobe "tcp_${TCP_CONGESTION}" >/dev/null 2>&1 \
+    && grep -qw "$TCP_CONGESTION" /proc/sys/net/ipv4/tcp_available_congestion_control; then
+    cc_ok=1
+  else
+    warn "拥塞控制 ${TCP_CONGESTION} 不可用, 不修改 tcp_congestion_control"
+  fi
+  if modprobe "sch_${TCP_QDISC}" >/dev/null 2>&1; then
+    qdisc_ok=1
+  else
+    warn "队列规则 ${TCP_QDISC} 不可用, 不修改 default_qdisc"
+  fi
+
+  local body=""
+  (( cc_ok )) && module_needs_load "tcp_${TCP_CONGESTION}" && body+="tcp_${TCP_CONGESTION}"$'\n'
+  (( qdisc_ok )) && module_needs_load "sch_${TCP_QDISC}" && body+="sch_${TCP_QDISC}"$'\n'
+  if [[ -n $body ]]; then
+    write_file "$MODULES_LOAD_NET" 644 <<EOF || true
+# Managed by server-init
+${body}
+EOF
+  elif [[ -f $MODULES_LOAD_NET ]]; then
+    backup_file "$MODULES_LOAD_NET"
+    rm -f "$MODULES_LOAD_NET"
+    info "内核已内建或不支持对应模块, 已移除 ${MODULES_LOAD_NET}"
+  fi
+
+  # min <= default <= max。默认接收 128K、发送 16K, 只把上限抬到 TCP_WINDOW_BYTES。
+  # 不改 rmem_default/wmem_default: 那是所有 socket (含 UDP) 的初始值, 抬高会白占内存。
+  # 不改 tcp_mem: 那是全部 TCP 连接共享的页数上限, 内核已按内存算好。
+  local max=$TCP_WINDOW_BYTES rdef=131072 wdef=16384
+  (( rdef > max )) && rdef=$max
+  (( wdef > max )) && wdef=$max
+  local lowat=16384
+  (( lowat > max / 2 )) && lowat=$(( max / 2 ))
+
+  local lines="" key
+  # ipv4 命名空间里的 tcp_* 同时作用于 IPv6
+  if (( qdisc_ok )) && net_sysctl_has net.core.default_qdisc; then
+    lines+="net.core.default_qdisc = ${TCP_QDISC}"$'\n'
+  fi
+  if (( cc_ok )) && net_sysctl_has net.ipv4.tcp_congestion_control; then
+    lines+="net.ipv4.tcp_congestion_control = ${TCP_CONGESTION}"$'\n'
+  fi
+  # 窗口 >64K 依赖 window scaling; moderate_rcvbuf 关掉的话接收缓冲不会自动涨
+  for key in net.ipv4.tcp_window_scaling net.ipv4.tcp_moderate_rcvbuf; do
+    net_sysctl_has "$key" && lines+="${key} = 1"$'\n'
+  done
+  net_sysctl_has net.core.rmem_max && lines+="net.core.rmem_max = ${max}"$'\n'
+  net_sysctl_has net.core.wmem_max && lines+="net.core.wmem_max = ${max}"$'\n'
+  net_sysctl_has net.ipv4.tcp_rmem && lines+="net.ipv4.tcp_rmem = 4096 ${rdef} ${max}"$'\n'
+  net_sysctl_has net.ipv4.tcp_wmem && lines+="net.ipv4.tcp_wmem = 4096 ${wdef} ${max}"$'\n'
+  # BBR 把窗口放大之后, 这三项避免空闲重置、PMTU 黑洞和本地发送队列堆积
+  net_sysctl_has net.ipv4.tcp_mtu_probing && lines+="net.ipv4.tcp_mtu_probing = 1"$'\n'
+  net_sysctl_has net.ipv4.tcp_slow_start_after_idle && lines+="net.ipv4.tcp_slow_start_after_idle = 0"$'\n'
+  net_sysctl_has net.ipv4.tcp_notsent_lowat && lines+="net.ipv4.tcp_notsent_lowat = ${lowat}"$'\n'
+
+  if [[ -z $lines ]]; then
+    warn "没有可写的网络 sysctl, 跳过"
+    return 0
+  fi
+  write_file "$SYSCTL_NET_FILE" 644 <<EOF || true
+# Managed by server-init
+# ${TCP_CONGESTION} + ${TCP_QDISC}, 单连接 TCP 窗口上限 ${TCP_WINDOW_DESC}
+# tcp_rmem/tcp_wmem: min default max (字节)。只提高上限。
+# 不写 net.ipv4.tcp_mem (全局页数上限, 内核按内存计算)。
+${lines}
+EOF
+  if ! sysctl -q -p "$SYSCTL_NET_FILE"; then
+    warn "部分网络参数未能立即生效, 配置已写入 ${SYSCTL_NET_FILE}"
+  fi
+
+  local got
+  if (( cc_ok )); then
+    got=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    if [[ $got == "$TCP_CONGESTION" ]]; then
+      ok "拥塞控制: ${got} (新连接生效, 已有连接不变)"
+    else
+      warn "拥塞控制当前是 ${got:-未知}, 未能设为 ${TCP_CONGESTION}"
+    fi
+  fi
+  if (( qdisc_ok )); then
+    got=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    if [[ $got == "$TCP_QDISC" ]]; then
+      ok "default_qdisc: ${got}"
+    else
+      warn "default_qdisc 当前是 ${got:-未知}, 未能设为 ${TCP_QDISC}"
+    fi
+    apply_net_qdisc "$TCP_QDISC"
+  fi
+
+  got=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $NF}' || true)
+  local gotw
+  gotw=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | awk '{print $NF}' || true)
+  if [[ $got == "$max" && $gotw == "$max" ]]; then
+    ok "TCP 窗口上限: $(bytes_human "$max") (rmem/wmem)"
+  else
+    warn "TCP 窗口上限当前 rmem=${got:-未知} wmem=${gotw:-未知}, 预期 $(bytes_human "$max")"
+  fi
+  note "网络: ${TCP_CONGESTION} + ${TCP_QDISC}, TCP 窗口上限 ${TCP_WINDOW_DESC} (新连接生效)"
 }
 
 write_shared_bashrc() {
@@ -2029,6 +2474,7 @@ main() {
   fi
 
   select_modules
+  select_net
   collect_baseline
   collect_packages
   collect_user
@@ -2038,6 +2484,7 @@ main() {
   collect_fail2ban
   collect_docker
   collect_swap
+  collect_net
   collect_shell_env
   show_plan
 
@@ -2050,6 +2497,7 @@ main() {
   [[ $ENABLE_FAIL2BAN == yes ]]  && do_fail2ban
   [[ $ENABLE_DOCKER == yes ]]    && do_docker
   [[ $ENABLE_SWAP == yes ]]      && do_swap
+  [[ $ENABLE_NET == yes ]]       && do_net
   [[ $ENABLE_SHELL_ENV == yes ]] && do_shell_env
   [[ $ENABLE_SSH == yes ]]       && confirm_and_lockdown
 

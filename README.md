@@ -22,6 +22,7 @@ Debian / Ubuntu 新服务器初始化脚本。单文件，可重复执行，所�
 | FAIL2BAN | sshd jail，systemd 日志后端，3 次失败封 24 小时，再犯时封禁时间递增，最长 4 周。白名单 IP 自动加入 ignoreip；**没有白名单时自己的 IP 也会被封**，不要在当前来源 IP 上做失败登录测试（解封：`fail2ban-client set sshd unbanip <IP>`） |
 | DOCKER | 官方源安装 CE + compose 插件，日志轮转，live-restore，可选加入 docker 组 |
 | SWAP | 按内存给出建议值，已有 swap 或在容器中运行时跳过，swappiness=10 |
+| NET | BBR + fq，TCP 窗口按带宽 × 延迟计算。**默认关闭**，交互时单独询问 |
 | SHELL_ENV | alias、彩色 PS1（显示退出码）、vim 配置（鼠标 + OSC52 复制） |
 
 ## 三种运行方式
@@ -119,6 +120,45 @@ Docker 发布的端口（`-p 8080:80`）默认直接写 iptables，**会绕过 U
   sudo ufw route allow proto tcp from any to any port 80
   ```
 
+## 网络优化 (BBR + fq + TCP 窗口)
+
+默认关闭，不在主模块列表里。交互运行时会单独列出一项，初始是 `[ ]`，输入 `1` 才执行，直接回车保持关闭。非交互要开就设 `ENABLE_NET=yes`。
+
+窗口在**目标服务器上**算：填满一条连接需要的在途数据是带宽 × 延迟（BDP），和编写脚本的电脑无关。
+
+`TCP_WINDOW_MAX=auto` 时：
+
+```text
+单连接缓冲上限 = 2 × 上行带宽 × RTT
+```
+
+取 2 倍是因为套接字缓冲里还有协议开销，缓冲要比线上的在途数据大，窗口才真能涨到一个 BDP。这是上限，不是预分配。内核仍按每条连接自己的带宽和延迟自动涨，最多涨到这个值。
+
+| 输入 | 从哪来 |
+| --- | --- |
+| 带宽 | 默认路由那块网卡的 `/sys/class/net/<网卡>/speed`。读不到时交互里会问；非交互按 1Gbit，并在计划里写明。虚拟网卡常把限速套餐报成 10G，这时设 `TCP_BANDWIDTH=200Mbit` 这类值 |
+| 延迟 | 默认 200ms，表示一条连接要能填满的跨区路径。当前 SSH 的 RTT 更高时改用实测。不 ping 公共 DNS：那些地址是就近的，测出来只有几毫秒，窗口会被算小 |
+| 内存 | 只做封顶，不参与乘法。结果不超过这台机器内存的 1/4，且不超过 128M |
+
+例如 1Gbit × 200ms × 2 是 50,000,000 字节，向上取整后为 48M。10Gbit × 200ms 会算出大约 477M，然后被 128M 或内存 1/4 封顶。客户端都在近处时把 `TCP_RTT_MS` 写成实际毫秒数，窗口会按比例变小。
+
+不修改 `net.ipv4.tcp_mem`（全部 TCP 连接共享的内存上限，内核已经按内存算过）。
+
+| 参数 | 值 | 原因 |
+| --- | --- | --- |
+| `net.ipv4.tcp_congestion_control` | `bbr` | 同时作用于 IPv6。只影响之后新建的连接 |
+| `net.core.default_qdisc` | `fq` | BBR 的 pacing 要靠 fq。`fq_codel` 不认这个节奏 |
+| `net.ipv4.tcp_rmem` / `tcp_wmem` | `4096 131072 <上限>` / `4096 16384 <上限>` | 只提高单连接上限。min / 初始值不动，避免每条连接一上来就占内存 |
+| `net.core.rmem_max` / `wmem_max` | 与上面的上限相同 | `setsockopt` 的上限。自动调节看的是 `tcp_rmem` / `tcp_wmem` |
+| `tcp_window_scaling` / `tcp_moderate_rcvbuf` | `1` | 否则窗口过不了 64K，接收缓冲也不会自动涨 |
+| `tcp_mtu_probing` | `1` | 路径把 ICMP 丢掉时，BBR 不会卡在错误的 MTU 上 |
+| `tcp_slow_start_after_idle` | `0` | 连接空闲后再传数据时，不把拥塞窗口打回慢启动 |
+| `tcp_notsent_lowat` | `16384` | 窗口变大之后，限制本地还没发出去的数据，避免延迟堆高 |
+
+当前处于 UP 的普通网卡会立刻换成 fq：多队列网卡只改子队列，不拆掉 mq；htb、cake 这类整形队列保持原样。容器网卡（veth、docker、bridge 等）不动。重启后新网卡按 `default_qdisc=fq` 创建。
+
+内核没有 `tcp_bbr` 或当前环境写不了这些 sysctl（常见于容器）时，会警告并跳过对应项，不中断后面的模块。
+
 ## vim 复制说明
 
 vim 配置为 `mouse=a` + OSC52：
@@ -139,6 +179,9 @@ vim 配置为 `mouse=a` + OSC52：
 | `/etc/server-init/summary.txt` | 最近一次执行的摘要 |
 | `/etc/server-init/bashrc.sh` | 共享 shell 配置，由各用户 `~/.bashrc` 末尾 source |
 | `/etc/server-init/vimrc.vim` | 共享 vim 配置 |
+| `/etc/sysctl.d/99-server-init.conf` | swappiness |
+| `/etc/sysctl.d/99-server-init-net.conf` | BBR、fq、TCP 窗口 |
+| `/etc/modules-load.d/server-init-net.conf` | 开机加载 `tcp_bbr`、`sch_fq`（内建则不写） |
 | `/etc/ssh/sshd_config.d/00-server-init.conf` | SSH 配置 |
 | `/etc/fail2ban/jail.d/server-init.local` | fail2ban 配置 |
 | `/etc/sudoers.d/90-server-init-<user>` | 免密 sudo（仅启用时存在） |
@@ -152,4 +195,5 @@ vim 配置为 `mouse=a` + OSC52：
 | UFW | `ufw disable`；如需去掉 Docker 规则，用 `/etc/ufw/after.rules.bak.server-init.*` 还原 |
 | fail2ban | `rm /etc/fail2ban/jail.d/server-init.local && systemctl restart fail2ban` |
 | swap | `swapoff /swapfile && rm /swapfile`，再删除 `/etc/fstab` 中对应的行 |
+| 网络优化 | `rm /etc/sysctl.d/99-server-init-net.conf /etc/modules-load.d/server-init-net.conf && sysctl --system`。已改的网卡可 `tc qdisc replace dev <网卡> root fq_codel`，或重启 |
 | Shell 环境 | 删除 `~/.bashrc` 和 `/etc/skel/.bashrc` 中 `>>> server-init >>>` 到 `<<< server-init <<<` 之间的块，再删除 `/etc/vim/vimrc.local` |
