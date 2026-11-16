@@ -94,6 +94,9 @@ OS_VERSION_ID=""
 OS_CODENAME=""
 CUR_SSH_PORTS=()
 SSH_KEYS_TO_ADD=()
+# 已确认的当前 SSH 来源 IP (confirm_ssh_peer 填充, 之后 ssh_peer_ips 直接返回它)
+SSH_PEERS=()
+SSH_PEERS_CONFIRMED=0
 REBOOT_REQUIRED=0
 SUMMARY_LINES=()
 
@@ -300,7 +303,7 @@ ip_allowed() {
       [[ $e == */* ]] && bits=${e#*/}
       mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
       (( ($(ipv4_to_int "$ip") & mask) == ($(ipv4_to_int "$net") & mask) )) && return 0
-    elif [[ $ip == *:* && $e == */* ]]; then
+    elif [[ $ip == *:* && $e == *:* && $e == */* ]]; then
       unknown=1
     fi
   done
@@ -423,7 +426,7 @@ server_ips() {
 # TCP 连接的对端。不能用"所有已建立的 22 端口连接": 公网机器上随时有爆破者处于认证阶段,
 # 它们的 IP 会被误当成自己的来源 (误中止, 或被当成白名单默认值推荐给用户)。
 # 不是通过 SSH 运行 (控制台 / cloud-init) 时输出为空
-ssh_peer_ips() {
+detect_ssh_peer_ips() {
   local peer=""
   if [[ -n ${SSH_CONNECTION:-} ]]; then
     peer=${SSH_CONNECTION%% *}
@@ -441,7 +444,93 @@ ssh_peer_ips() {
     done
   fi
   [[ -n $peer ]] || return 0
-  sed -E 's/^\[?([^]]*)\]?:[0-9]+$/\1/; s/^::ffff://' <<<"$peer"
+  normalize_ssh_peer "$peer"
+}
+
+# ss 的对端是 IPv4:port 或 [IPv6]:port; SSH_CONNECTION 的第一段已经不带端口。
+# 不能按「最后一个冒号后面是数字」裁剪: 2001:db8::1 会被裁成 2001:db8:。
+# 那个残缺地址仍能通过 valid_ip_or_cidr, 接着被写进 UFW / fail2ban 白名单, 真正的来源却不在里面。
+normalize_ssh_peer() {
+  local p=$1 mapped
+  if [[ $p =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+    p=${BASH_REMATCH[1]}
+  elif [[ $p =~ ^(::ffff:)?([0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]+)$ ]]; then
+    p=${BASH_REMATCH[1]}${BASH_REMATCH[2]}
+  fi
+  # OpenSSH 把 IPv4 映射地址写成 ::ffff:192.0.2.1。::ffff:1 是普通 IPv6, 不能去掉前缀。
+  if [[ $p == ::ffff:* ]]; then
+    mapped=${p#::ffff:}
+    if [[ $mapped =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      p=$mapped
+    fi
+  fi
+  printf '%s\n' "$p"
+}
+
+# 已经过 confirm_ssh_peer 确认时返回确认结果 (用户可能手动修正过), 否则现场检测
+ssh_peer_ips() {
+  if (( SSH_PEERS_CONFIRMED )); then
+    (( ${#SSH_PEERS[@]} )) && printf '%s\n' "${SSH_PEERS[@]}"
+    return 0
+  fi
+  detect_ssh_peer_ips
+}
+
+# 来源 IP 只接受单个 IPv4/IPv6 地址, 不接受 CIDR
+valid_peer_ip() { valid_ip_or_cidr "$1" && [[ $1 != */* ]]; }
+
+# ask_peer_ips ARRAY "提示": 交互输入来源 IP 列表, 格式错误就重问; 空输入 = 空数组 (跳过)
+ask_peer_ips() {
+  local -n __out=$1
+  local __prompt=$2 __in __ip __bad
+  local -a __list
+  while true; do
+    ask __in "$__prompt" ""
+    read -ra __list <<<"$__in"
+    __bad=""
+    for __ip in "${__list[@]}"; do valid_peer_ip "$__ip" || { __bad=$__ip; break; }; done
+    if [[ -z $__bad ]]; then
+      __out=("${__list[@]}")
+      return 0
+    fi
+    warn "格式错误: ${__bad} (只接受单个 IPv4/IPv6 地址, 空格分隔, 不接受 CIDR)"
+  done
+}
+
+# 开始任何操作前先确认当前 SSH 会话的来源 IP。
+# 之后的白名单默认值 / 自动加白 / 防锁死检查 / fail2ban 提醒都以这里确认的结果为准。
+# 交互模式: 展示并询问是否正确, 不正确可手动输入; 非交互模式: 展示后直接继续。
+# 检测到的值无法识别 (如带 %eth0 的链路本地地址) 时只丢弃并提示, 不中止。
+confirm_ssh_peer() {
+  local -a peers=() detected=()
+  local right ip
+  mapfile -t detected < <(detect_ssh_peer_ips | grep -v '^[[:space:]]*$' || true)
+  step "确认当前 SSH 来源 IP"
+  for ip in "${detected[@]}"; do
+    if valid_peer_ip "$ip"; then peers+=("$ip"); else warn "忽略无法识别的来源地址: ${ip}"; fi
+  done
+  if (( ${#peers[@]} == 0 )); then
+    if (( INTERACTIVE )); then
+      warn "未检测到 SSH 来源 IP (可能通过控制台 / cloud-init 运行)"
+      ask_peer_ips peers "手动输入你的公网 IP (空格分隔, 回车跳过)"
+    else
+      info "未检测到 SSH 来源 IP (控制台 / cloud-init), 跳过来源确认"
+    fi
+  else
+    info "当前 SSH 连接来自: ${peers[*]}"
+    if (( INTERACTIVE )); then
+      ask_yn right "来源 IP 是否正确 (将作为白名单默认值并用于防锁死检查)" y
+      [[ $right == yes ]] || ask_peer_ips peers "请输入正确的来源 IP (空格分隔, 回车表示不确定, 跳过)"
+    fi
+  fi
+  SSH_PEERS=("${peers[@]}")
+  SSH_PEERS_CONFIRMED=1
+  if (( ${#SSH_PEERS[@]} )); then
+    ok "来源 IP 已确认: ${SSH_PEERS[*]}"
+  else
+    warn "没有可用的来源 IP, 后面不做防锁死检查, 请自行确认白名单包含你的 IP"
+  fi
+  return 0
 }
 
 sshd_bin() { command -v sshd || echo /usr/sbin/sshd; }
@@ -918,13 +1007,34 @@ collect_ssh_whitelist() {
   for ip in $SSH_ALLOW_IPS; do
     valid_ip_or_cidr "$ip" || die "白名单格式错误: ${ip}"
   done
+  ensure_whitelist_covers_peers
   check_whitelist_covers_peers
+}
+
+# 白名单非空但不含已确认的来源 IP 时把它加进去, 防止把自己关在门外。
+# 非交互模式直接加 (并提示); 交互模式询问, 拒绝则交给 check_whitelist_covers_peers 处理
+ensure_whitelist_covers_peers() {
+  [[ ${ENABLE_UFW:-} == yes || ${ENABLE_FAIL2BAN:-} == yes ]] && [[ -n ${SSH_ALLOW_IPS:-} ]] || return 0
+  local peer rc add
+  for peer in $(ssh_peer_ips); do
+    rc=0
+    ip_allowed "$peer" "$SSH_ALLOW_IPS" || rc=$?
+    (( rc == 1 )) || continue
+    add=yes
+    if (( INTERACTIVE )); then
+      ask_yn add "当前来源 ${peer} 不在白名单 [${SSH_ALLOW_IPS}] 内, 是否加入" y
+    fi
+    if [[ $add == yes ]]; then
+      SSH_ALLOW_IPS="${SSH_ALLOW_IPS} ${peer}"
+      info "已把当前来源 ${peer} 加入 SSH 白名单"
+    fi
+  done
 }
 
 # 当前 SSH 会话的来源 IP 必须在白名单内: 否则 UFW 启用后 (ENABLE_SSH=no 时立即,
 # 否则在锁定关闭旧端口后) 就无法再从这里登录
 check_whitelist_covers_peers() {
-  [[ $ENABLE_UFW == yes && -n $SSH_ALLOW_IPS ]] || return 0
+  [[ ${ENABLE_UFW:-} == yes && -n ${SSH_ALLOW_IPS:-} ]] || return 0
   local peer rc go
   local -a missing=()
   for peer in $(ssh_peer_ips); do
@@ -1013,7 +1123,7 @@ suggest_swap_mb() {
   local mem_mb=$1 disk_mb=$2 s
   if   (( mem_mb <= 2048 )); then s=$(( mem_mb * 2 ))
   elif (( mem_mb <= 8192 )); then s=$mem_mb
-  else s=4096
+  else echo 0; return 0   # 内存 > 8G 不加 swap
   fi
   (( s > disk_mb / 4 )) && s=$(( disk_mb / 4 ))
   # 取整到 256M
@@ -1051,6 +1161,11 @@ collect_swap() {
   # 自动大小: 磁盘太小时直接跳过; 用户明确指定的大小不合理才报错
   local auto=0
   if ! is_set SWAP_SIZE || [[ $SWAP_SIZE == auto ]]; then
+    if (( mem_mb > 8192 )); then
+      info "内存 ${mem_mb}MB > 8G, 不加 swap (需要可显式指定 SWAP_SIZE)"
+      ENABLE_SWAP=no
+      return 0
+    fi
     if (( sug < 256 || sug > disk_mb - 2048 )); then
       warn "根分区可用空间不足 (${disk_mb}MB), 跳过 swap"
       ENABLE_SWAP=no
@@ -1257,6 +1372,7 @@ show_plan() {
     printf '  %-4s %s\n' "$( [[ ${!key} == yes ]] && echo '[x]' || echo '[ ]')" "${m#*|}"
   done
   echo
+  echo "  当前 SSH 来源 IP: ${SSH_PEERS[*]:-未检测到}"
   [[ $ENABLE_BASELINE == yes ]] && echo "  时区: ${TIMEZONE}, journald 上限: ${JOURNALD_MAX_USE}"
   [[ $ENABLE_PACKAGES == yes ]] && echo "  软件包档位: ${PACKAGE_PROFILE} ${EXTRA_PACKAGES:+(额外: ${EXTRA_PACKAGES})}"
   if [[ -n ${NEW_USER:-} ]]; then
@@ -2351,6 +2467,9 @@ run_lockdown_only() {
   [[ -n ${NEW_USER:-} && -n ${SSH_PORT:-} ]] || die "状态文件不完整"
   # 旧版本的状态文件可能没有这些项
   : "${SSH_CLIENT_ALIVE_INTERVAL:=60}" "${SSH_CLIENT_ALIVE_COUNT_MAX:=10}"
+  # 旧端口关闭后只剩白名单放行的新端口: 当前来源不在白名单内就会把自己锁在外面
+  # (完整模式会自动加白; 这里 UFW 规则已经落地, 只检查, 非交互要硬跑用 FORCE=yes)
+  check_whitelist_covers_peers
   # 明确传了 --ssh-lockdown: 非交互模式下直接执行, 不再要求 SSH_LOCKDOWN=yes
   # shellcheck disable=SC2034  # 由 confirm_and_lockdown 里的 is_yes SSH_LOCKDOWN 间接读取
   (( INTERACTIVE )) || SSH_LOCKDOWN=yes
@@ -2463,6 +2582,9 @@ main() {
   check_os
   decide_interactive
   detect_ssh_ports
+  # 先确认来源 IP, 再做后面的一切: 完整模式用它做白名单默认值 / 自动加白,
+  # --ssh-lockdown 用它检查关旧端口后自己是否还能登录
+  confirm_ssh_peer
 
   if [[ $MODE == lockdown ]]; then
     run_lockdown_only

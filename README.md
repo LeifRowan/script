@@ -21,7 +21,7 @@ Debian / Ubuntu 新服务器初始化脚本。单文件，可重复执行，所�
 | SSH | 公钥（GitHub 用户名或 https 链接拉取 / 粘贴 / 配置）、改端口、保活；**验证登录后**再禁 root、禁密码 |
 | FAIL2BAN | sshd jail，systemd 日志后端，3 次失败封 24 小时，再犯时封禁时间递增，最长 4 周。白名单 IP 自动加入 ignoreip；**没有白名单时自己的 IP 也会被封**，不要在当前来源 IP 上做失败登录测试（解封：`fail2ban-client set sshd unbanip <IP>`） |
 | DOCKER | 官方源安装 CE + compose 插件，日志轮转，live-restore，可选加入 docker 组 |
-| SWAP | 按内存给出建议值，已有 swap 或在容器中运行时跳过，swappiness=10 |
+| SWAP | 按内存给出建议值（>8G 不加），已有 swap 或在容器中运行时跳过，swappiness=10 |
 | NET | BBR + fq，TCP 窗口按带宽 × 延迟计算。**默认关闭**，交互时单独询问 |
 | SHELL_ENV | alias、彩色 PS1（显示退出码）、vim 配置（鼠标 + OSC52 复制） |
 
@@ -106,7 +106,8 @@ curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/init.sh | sudo ba
 - Ubuntu 22.10+ 使用 `ssh.socket` 激活，脚本会自动执行 `daemon-reload` 并重启 socket，端口修改才能生效。
 - 新的保活参数**只对新连接生效**，当前会话仍用旧配置。担心等待期间断线的话，可以在本地 `~/.ssh/config` 加 `ServerAliveInterval 30`，或在 tmux 里运行脚本。
 - 云服务器还需要在**安全组**里放行新端口，脚本管不到这一层。
-- 防锁死检查只看**当前会话**的来源 IP（`SSH_CONNECTION`，或沿父进程链找到本会话的 sshd 连接），不会把其他正在爆破的连接误当成自己。
+- 脚本开始时会先检测并确认**当前会话**的来源 IP（`SSH_CONNECTION`，或沿父进程链找到本会话的 sshd 连接），不会把其他正在爆破的连接误当成自己。交互模式下会询问是否正确，可手动修正；非交互模式展示后直接继续。
+- 设置了 `SSH_ALLOW_IPS` 但不含该来源 IP 时，会**自动把它加进白名单**（交互模式询问，非交互直接加），不会把自己关在门外。交互下拒绝加入才会触发「仍然继续 / 中止」的防锁死确认。
 - 重复执行时会按最新的 `SSH_ALLOW_IPS` 同步 UFW 规则：从"任意 IP"改为白名单会删掉任意来源的放行，白名单 IP 变化时删掉不再需要的旧规则。
 
 ## Docker 与 UFW
