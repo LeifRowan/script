@@ -1,6 +1,6 @@
 # server-init
 
-Debian / Ubuntu 新服务器初始化脚本。单文件，可重复执行，所有修改前自动备份。
+Debian / Ubuntu 服务器初始化脚本，也可以当工具用：每个模块都能单独执行（如 `sudo bash init.sh docker`）。单文件，可重复执行，所有修改前自动备份。
 
 支持系统：Debian 12 / 13，Ubuntu 22.04 / 24.04 / 26.04 LTS（其他版本需 `FORCE=yes`）。
 
@@ -11,21 +11,49 @@ Debian / Ubuntu 新服务器初始化脚本。单文件，可重复执行，所�
 
 ## 功能
 
-| 模块 | 内容 |
-| --- | --- |
-| UPDATE | `apt full-upgrade` + `autoremove`，自动等待 cloud-init 和 apt 锁 |
-| BASELINE | 时区（默认 UTC）、systemd-timesyncd（已有 chrony 则保留）、journald 上限 500M |
-| PACKAGES | 内存 ≥2G 且根分区可用 ≥10G 装标准包，否则装最小包 |
-| USER | 创建用户、家目录 750、可选 sudo 组 / 免密 sudo（`visudo -c` 校验） |
-| UFW | 入站默认拒绝；SSH 可设白名单；80/443 逐个询问；接管 Docker 发布的端口 |
-| SSH | 公钥（GitHub 用户名或 https 链接拉取 / 粘贴 / 配置）、改端口、保活；**验证登录后**再禁 root、禁密码 |
-| FAIL2BAN | sshd jail，systemd 日志后端，3 次失败封 24 小时，再犯时封禁时间递增，最长 4 周。白名单 IP 自动加入 ignoreip；**没有白名单时自己的 IP 也会被封**，不要在当前来源 IP 上做失败登录测试（解封：`fail2ban-client set sshd unbanip <IP>`） |
-| DOCKER | 官方源安装 CE + compose 插件，日志轮转，live-restore，可选加入 docker 组 |
-| SWAP | 按内存给出建议值（>8G 不加），已有 swap 或在容器中运行时跳过，swappiness=10 |
-| NET | BBR + fq，TCP 窗口按带宽 × 延迟计算。**默认关闭**，交互时单独询问 |
-| SHELL_ENV | alias、彩色 PS1（显示退出码）、vim 配置（鼠标 + OSC52 复制） |
+| 模块 | 命令行名 | 内容 |
+| --- | --- | --- |
+| UPDATE | `update` | `apt full-upgrade` + `autoremove`，自动等待 cloud-init 和 apt 锁 |
+| BASELINE | `baseline` | 时区（默认 UTC）、systemd-timesyncd（已有 chrony 则保留）、journald 上限 500M |
+| PACKAGES | `packages` | 内存 ≥2G 且根分区可用 ≥10G 装标准包，否则装最小包 |
+| USER | `user` | 创建用户、家目录 750、可选 sudo 组 / 免密 sudo（`visudo -c` 校验） |
+| UFW | `ufw` | 入站默认拒绝；SSH 可设白名单；80/443 逐个询问；接管 Docker 发布的端口 |
+| SSH | `ssh` | 公钥（GitHub 用户名或 https 链接拉取 / 粘贴 / 配置）、改端口、保活；**验证登录后**再禁 root、禁密码 |
+| FAIL2BAN | `fail2ban` | sshd jail，systemd 日志后端，3 次失败封 24 小时，再犯时封禁时间递增，最长 4 周。白名单 IP 自动加入 ignoreip；**没有白名单时自己的 IP 也会被封**，不要在当前来源 IP 上做失败登录测试（解封：`fail2ban-client set sshd unbanip <IP>`） |
+| DOCKER | `docker` | 官方源安装 CE + compose 插件，日志轮转，live-restore，可选加入 docker 组。UFW 已启用时自动补上端口接管规则 |
+| SWAP | `swap` | 按内存给出建议值（>8G 不加），已有 swap 或在容器中运行时跳过，swappiness=10 |
+| NET | `net` | BBR + fq，TCP 窗口按带宽 × 延迟计算。**默认关闭**，菜单里初始为 `[ ]` |
+| SHELL_ENV | `shell` | alias、彩色 PS1（显示退出码）、vim 配置（鼠标 + OSC52 复制） |
 
-## 三种运行方式
+`sudo bash init.sh --list` 可以打印这张表的命令行名。
+
+## 两种用法
+
+### 整机初始化
+
+不带模块参数运行，按菜单 / 配置决定执行哪些模块，一次问完所有参数后一口气跑完：
+
+```bash
+sudo bash init.sh                      # 交互
+sudo bash init.sh --config init.env    # 按配置文件
+```
+
+### 当工具用：只执行某几个模块
+
+在命令行直接写模块名，只执行这些模块，不显示模块菜单，配置文件里的 `ENABLE_*` 也会被忽略。模块自己的参数照常走「配置 > 交互 > 默认值」：
+
+```bash
+sudo bash init.sh docker               # 交互式装 Docker，会问要不要把某个已有用户加进 docker 组
+sudo bash init.sh -n swap              # 非交互，按默认策略直接加 swap
+sudo UFW_ALLOW_PORTS=8080/tcp bash init.sh -n ufw   # 补放行一个端口 (环境变量写在 sudo 后面)
+sudo bash init.sh -c init.env docker ufw             # 用配置文件里的参数补装 Docker + 防火墙
+```
+
+交互菜单里也能做同样的事：输入 `only 8` 只执行第 8 项，输入编号则切换对应模块的开关。
+
+只执行不涉及 SSH / UFW / fail2ban 的模块时，不会再询问当前 SSH 来源 IP。
+
+## 三种配置来源
 
 配置优先级：**环境变量 > `--config` 本地文件 > `--config-url` 远程文件 > 交互输入 > 默认值**
 
@@ -42,7 +70,7 @@ sudo bash init.sh
 curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/init.sh | sudo bash
 ```
 
-开头会列出所有模块供你关闭、一次问完所有参数、展示执行计划，确认后一口气跑完。只有最后验证 SSH 登录时会再暂停一次。
+开头会列出所有模块（输入编号切换开关，`only 编号` 只执行某几个）、一次问完所有参数、展示执行计划，确认后一口气跑完。只有最后验证 SSH 登录时会再暂停一次。
 
 ### 2. 环境变量
 
@@ -108,7 +136,8 @@ curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/init.sh | sudo ba
 - 云服务器还需要在**安全组**里放行新端口，脚本管不到这一层。
 - 脚本开始时会先检测并确认**当前会话**的来源 IP（`SSH_CONNECTION`，或沿父进程链找到本会话的 sshd 连接），不会把其他正在爆破的连接误当成自己。交互模式下会询问是否正确，可手动修正；非交互模式展示后直接继续。
 - 设置了 `SSH_ALLOW_IPS` 但不含该来源 IP 时，会**自动把它加进白名单**（交互模式询问，非交互直接加），不会把自己关在门外。交互下拒绝加入才会触发「仍然继续 / 中止」的防锁死确认。
-- 重复执行时会按最新的 `SSH_ALLOW_IPS` 同步 UFW 规则：从"任意 IP"改为白名单会删掉任意来源的放行，白名单 IP 变化时删掉不再需要的旧规则。
+- 重复执行时会按最新的 `SSH_ALLOW_IPS` 同步 UFW 规则：从"任意 IP"改为白名单会删掉任意来源的放行，白名单 IP 变化时删掉不再需要的旧规则。没有再提供 `SSH_ALLOW_IPS` 时沿用上次保存的白名单，不会因为漏填而放开成任意 IP；要清空白名单需显式写 `SSH_ALLOW_IPS=`（交互时输入 `none`）。
+- 单独执行 `ssh` 模块时，若 UFW / fail2ban 已在运行，会自动放行新端口并让 fail2ban 同时监控新旧端口，锁定后再收紧。
 
 ## Docker 与 UFW
 
@@ -123,7 +152,7 @@ Docker 发布的端口（`-p 8080:80`）默认直接写 iptables，**会绕过 U
 
 ## 网络优化 (BBR + fq + TCP 窗口)
 
-默认关闭，不在主模块列表里。交互运行时会单独列出一项，初始是 `[ ]`，输入 `1` 才执行，直接回车保持关闭。非交互要开就设 `ENABLE_NET=yes`。
+默认关闭。模块菜单里初始是 `[ ]`，输入它的编号才执行，直接回车保持关闭。非交互要开就设 `ENABLE_NET=yes`，或直接 `sudo bash init.sh net`。
 
 窗口在**目标服务器上**算：填满一条连接需要的在途数据是带宽 × 延迟（BDP），和编写脚本的电脑无关。
 

@@ -18,7 +18,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly STATE_DIR="/etc/server-init"
 readonly STATE_FILE="${STATE_DIR}/state.env"
 readonly LOG_FILE="/var/log/server-init.log"
@@ -62,19 +62,61 @@ readonly KNOWN_KEYS=(
   AUTO_REBOOT
 )
 
-# 模块: key|说明。顺序即执行顺序
+# 模块: key|命令行名(逗号分隔, 第一个是正式名)|说明。顺序即执行顺序
 readonly MODULES=(
-  "UPDATE|系统更新 (apt full-upgrade)"
-  "BASELINE|时区 / 时间同步 / journald 日志上限"
-  "PACKAGES|常用软件"
-  "USER|创建用户"
-  "UFW|UFW 防火墙 (含 Docker 端口接管)"
-  "SSH|SSH 公钥 + 加固 (改端口/禁 root/禁密码)"
-  "FAIL2BAN|fail2ban (sshd)"
-  "DOCKER|Docker CE (官方源)"
-  "SWAP|swap"
-  "SHELL_ENV|Shell 环境优化 (alias / PS1 / vim)"
+  "UPDATE|update|系统更新 (apt full-upgrade)"
+  "BASELINE|baseline,base|时区 / 时间同步 / journald 日志上限"
+  "PACKAGES|packages,pkg,pkgs|常用软件"
+  "USER|user|创建用户"
+  "UFW|ufw,firewall|UFW 防火墙 (含 Docker 端口接管)"
+  "SSH|ssh|SSH 公钥 + 加固 (改端口/禁 root/禁密码)"
+  "FAIL2BAN|fail2ban,f2b|fail2ban (sshd)"
+  "DOCKER|docker|Docker CE (官方源)"
+  "SWAP|swap|swap"
+  "NET|net,network,bbr|网络优化 BBR + fq + TCP 窗口 (默认关闭)"
+  "SHELL_ENV|shell,shell_env,env|Shell 环境优化 (alias / PS1 / vim)"
 )
+
+# module_field "<MODULES 条目>" key|name|names|desc
+module_field() {
+  local key names desc
+  IFS='|' read -r key names desc <<<"$1"
+  case $2 in
+    key)   echo "$key" ;;
+    name)  echo "${names%%,*}" ;;
+    names) echo "$names" ;;
+    desc)  echo "$desc" ;;
+  esac
+}
+
+# 命令行里用的模块名 -> MODULES 里的 key。sudo bash init.sh docker swap 这样只执行指定模块
+module_key_for_name() {
+  local n=${1,,} m
+  n=${n//-/_}
+  for m in "${MODULES[@]}"; do
+    if [[ ",$(module_field "$m" names)," == *",${n},"* ]]; then
+      module_field "$m" key
+      return 0
+    fi
+  done
+  return 1
+}
+
+module_name_for_key() {
+  local m
+  for m in "${MODULES[@]}"; do
+    [[ $(module_field "$m" key) == "$1" ]] && { module_field "$m" name; return 0; }
+  done
+  echo "${1,,}"
+}
+
+list_modules() {
+  local m
+  printf '%-10s %s\n' "模块名" "说明"
+  for m in "${MODULES[@]}"; do
+    printf '%-10s %s\n' "$(module_field "$m" name)" "$(module_field "$m" desc)"
+  done
+}
 
 PKG_MINIMAL=(curl wget vim git ca-certificates gnupg unzip htop)
 PKG_STANDARD=("${PKG_MINIMAL[@]}" tmux jq zip rsync lsof net-tools bind9-dnsutils
@@ -89,6 +131,8 @@ INTERACTIVE=0
 CLI_CONFIG=""
 CLI_CONFIG_URL=""
 MODE="full"
+# 命令行位置参数指定的模块 key 列表; 非空时只执行这些模块, 不再显示模块菜单
+ONLY_MODULES=()
 OS_ID=""
 OS_VERSION_ID=""
 OS_CODENAME=""
@@ -535,6 +579,20 @@ confirm_ssh_peer() {
 
 sshd_bin() { command -v sshd || echo /usr/sbin/sshd; }
 
+# UFW 是否已安装并处于启用状态 (不管是本次还是之前启用的)。
+# ufw status 的输出会随 locale 翻译 (中文是 "状态： 激活"), 固定 LC_ALL=C 再匹配
+ufw_active() {
+  command -v ufw >/dev/null 2>&1 || return 1
+  [[ $(LC_ALL=C ufw status 2>/dev/null) == *"Status: active"* ]]
+}
+
+# 更新 fail2ban sshd jail 监控的端口 (逗号分隔) 并重载
+f2b_set_ports() {
+  [[ -f $F2B_JAIL ]] || return 0
+  sed -i -E "s/^port[[:space:]]*=.*/port    = $1/" "$F2B_JAIL" \
+    && { systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban; }
+}
+
 # 读取上次执行保存的状态值 (state.env 由 save_state 以 %q 写入)
 state_get() {
   local line v=""
@@ -706,52 +764,68 @@ wait_for_boot_jobs() {
 # -----------------------------------------------------------------------------
 # 参数收集 (所有问题在开头一次问完)
 # -----------------------------------------------------------------------------
-select_modules() {
-  local m key
-  for m in "${MODULES[@]}"; do
-    key="ENABLE_${m%%|*}"
-    is_set "$key" || printf -v "$key" yes
-    norm_yn "$key"
-  done
-  (( INTERACTIVE )) || return 0
-
-  step "选择要执行的模块"
-  local i=1 flag
+print_module_menu() {
+  local i=1 m key flag
   for m in "${MODULES[@]}"; do
     key="ENABLE_${m%%|*}"
     [[ ${!key} == yes ]] && flag="[x]" || flag="[ ]"
-    tty_print "  ${i}) ${flag} ${m#*|}"$'\n'
+    tty_print "  $(printf '%2d' "$i") ${flag} $(module_field "$m" desc)"$'\n'
     i=$((i + 1))
-  done
-  local off=""
-  ask off "输入要关闭的模块编号 (空格分隔, 回车全部按上面执行)" ""
-  local n
-  for n in $off; do
-    [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#MODULES[@]} )) || { warn "忽略无效编号: $n"; continue; }
-    m=${MODULES[$((n - 1))]}
-    printf -v "ENABLE_${m%%|*}" no
   done
 }
 
-# 网络优化不进上面的模块列表。那个列表默认全开, 只能填编号关闭。
-# 这里单独问, 默认关。配置或环境变量里写了 ENABLE_NET 时, 菜单里的初始状态跟配置走。
-select_net() {
-  if ! is_set ENABLE_NET; then
-    ENABLE_NET=no
+# 模块开关的来源, 优先级从高到低:
+#   1. 命令行位置参数 (sudo bash init.sh docker swap): 只执行这些, 不显示菜单
+#   2. 配置 / 环境变量里的 ENABLE_*
+#   3. 默认值: 除 NET 外全部 yes
+# 交互模式下再显示菜单: 输入编号切换开关; "only 8 9" 表示只执行这几个
+select_modules() {
+  local m key k
+  for m in "${MODULES[@]}"; do
+    key="ENABLE_${m%%|*}"
+    if (( ${#ONLY_MODULES[@]} )); then
+      printf -v "$key" no
+      for k in "${ONLY_MODULES[@]}"; do [[ $k == "${m%%|*}" ]] && printf -v "$key" yes; done
+      continue
+    fi
+    if ! is_set "$key"; then
+      if [[ ${m%%|*} == NET ]]; then printf -v "$key" no; else printf -v "$key" yes; fi
+    fi
+    norm_yn "$key"
+  done
+  if (( ${#ONLY_MODULES[@]} )); then
+    local names=()
+    for k in "${ONLY_MODULES[@]}"; do names+=("$(module_name_for_key "$k")"); done
+    info "只执行命令行指定的模块: ${names[*]}"
+    return 0
   fi
-  norm_yn ENABLE_NET
   (( INTERACTIVE )) || return 0
 
-  step "网络优化 (默认关闭)"
-  local flag="[ ]" choice=""
-  [[ $ENABLE_NET == yes ]] && flag="[x]"
-  tty_print "  1) ${flag} BBR + fq + TCP 窗口"$'\n'
-  ask choice "输入 1 切换开关, 回车保持上面的状态" ""
-  if [[ $choice == 1 ]]; then
-    if [[ $ENABLE_NET == yes ]]; then ENABLE_NET=no; else ENABLE_NET=yes; fi
-  elif [[ -n $choice ]]; then
-    warn "忽略无效输入: ${choice}, 网络优化保持$( [[ $ENABLE_NET == yes ]] && echo 开启 || echo 关闭 )"
+  step "选择要执行的模块"
+  print_module_menu
+  local in="" n only=0 words=()
+  ask in "输入编号切换开关 (空格分隔); 只执行某几个用 'only 编号' (如 only 8); 回车按上面执行" ""
+  read -ra words <<<"$in"
+  if (( ${#words[@]} )) && [[ ${words[0],,} == only ]]; then
+    only=1
+    words=("${words[@]:1}")
+    for m in "${MODULES[@]}"; do printf -v "ENABLE_${m%%|*}" no; done
   fi
+  for n in "${words[@]}"; do
+    [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#MODULES[@]} )) || { warn "忽略无效编号: $n"; continue; }
+    key="ENABLE_${MODULES[$((n - 1))]%%|*}"
+    if (( only )) || [[ ${!key} == no ]]; then printf -v "$key" yes; else printf -v "$key" no; fi
+  done
+  if [[ -n $in ]]; then
+    tty_print $'\n'
+    print_module_menu
+  fi
+  local any=0
+  for m in "${MODULES[@]}"; do
+    key="ENABLE_${m%%|*}"
+    [[ ${!key} == yes ]] && any=1
+  done
+  (( any )) || die "没有选中任何模块"
 }
 
 collect_baseline() {
@@ -989,20 +1063,31 @@ collect_ssh() {
 }
 
 collect_ssh_whitelist() {
-  # UFW 和 fail2ban 都会用到
-  [[ $ENABLE_UFW == yes || $ENABLE_FAIL2BAN == yes ]] || return 0
+  # UFW 和 fail2ban 都会用到。没配置时沿用上次保存的白名单: 重复执行或单独跑某个模块时
+  # 不能因为没填这一项就悄悄把白名单放开成任意 IP (要清空就显式写 SSH_ALLOW_IPS=)
+  local prev
+  prev=$(state_get SSH_ALLOW_IPS)
+  if [[ $ENABLE_UFW != yes && $ENABLE_FAIL2BAN != yes ]]; then
+    is_set SSH_ALLOW_IPS || SSH_ALLOW_IPS=$prev
+    return 0
+  fi
   if ! is_set SSH_ALLOW_IPS && (( INTERACTIVE )); then
     local peers want
     peers=$(ssh_peer_ips | tr '\n' ' ')
     [[ -n $peers ]] && info "当前 SSH 连接来源 IP: ${peers}"
-    ask_yn want "是否限制 SSH 只允许白名单 IP 访问" n
-    if [[ $want == yes ]]; then
-      ask SSH_ALLOW_IPS "白名单 IP/CIDR (空格分隔)" "${peers% }"
+    if [[ -n $prev ]]; then
+      ask SSH_ALLOW_IPS "SSH 白名单 IP/CIDR (空格分隔; 输入 none 改为允许任意 IP)" "$prev"
+      [[ ${SSH_ALLOW_IPS,,} == none ]] && SSH_ALLOW_IPS=""
     else
-      SSH_ALLOW_IPS=""
+      ask_yn want "是否限制 SSH 只允许白名单 IP 访问" n
+      if [[ $want == yes ]]; then
+        ask SSH_ALLOW_IPS "白名单 IP/CIDR (空格分隔)" "${peers% }"
+      else
+        SSH_ALLOW_IPS=""
+      fi
     fi
   fi
-  is_set SSH_ALLOW_IPS || SSH_ALLOW_IPS=""
+  is_set SSH_ALLOW_IPS || SSH_ALLOW_IPS=$prev
   local ip
   for ip in $SSH_ALLOW_IPS; do
     valid_ip_or_cidr "$ip" || die "白名单格式错误: ${ip}"
@@ -1106,7 +1191,24 @@ collect_docker() {
   is_set DOCKER_LOG_MAX_FILE || DOCKER_LOG_MAX_FILE=3
   [[ $DOCKER_LOG_MAX_SIZE =~ ^[1-9][0-9]*[kmg]$ ]] || die "DOCKER_LOG_MAX_SIZE 格式错误: ${DOCKER_LOG_MAX_SIZE} (如 50m)"
   [[ $DOCKER_LOG_MAX_FILE =~ ^[1-9][0-9]*$ ]] || die "DOCKER_LOG_MAX_FILE 必须是正整数: ${DOCKER_LOG_MAX_FILE}"
-  # ENABLE_USER=yes 时 collect_user 已询问 (默认 yes); 否则不改动已有用户的组, 默认 no
+  # ENABLE_USER=yes 时 collect_user 已询问 (默认 yes)。
+  # 没开用户模块 (如单独执行 docker) 时交互下问一次要加入 docker 组的已有用户, 非交互默认 no
+  if ! is_set DOCKER_USER_GROUP && (( INTERACTIVE )) && [[ $ENABLE_USER == no ]]; then
+    if [[ -z ${NEW_USER:-} ]]; then
+      local u=""
+      ask u "把哪个已有用户加入 docker 组 (等同 root 权限, 回车跳过)" ""
+      if [[ -n $u ]]; then
+        if id "$u" >/dev/null 2>&1; then
+          NEW_USER=$u
+          DOCKER_USER_GROUP=yes
+        else
+          warn "用户 ${u} 不存在, 不加入 docker 组"
+        fi
+      fi
+    else
+      resolve_yn DOCKER_USER_GROUP "是否把 ${NEW_USER} 加入 docker 组 (等同 root 权限)" n
+    fi
+  fi
   is_set DOCKER_USER_GROUP || DOCKER_USER_GROUP=no
   norm_yn DOCKER_USER_GROUP
   if [[ $DOCKER_USER_GROUP == yes ]]; then
@@ -1369,10 +1471,15 @@ show_plan() {
   local m key
   for m in "${MODULES[@]}"; do
     key="ENABLE_${m%%|*}"
-    printf '  %-4s %s\n' "$( [[ ${!key} == yes ]] && echo '[x]' || echo '[ ]')" "${m#*|}"
+    printf '  %-4s %s\n' "$( [[ ${!key} == yes ]] && echo '[x]' || echo '[ ]')" "$(module_field "$m" desc)"
   done
   echo
-  echo "  当前 SSH 来源 IP: ${SSH_PEERS[*]:-未检测到}"
+  (( SSH_PEERS_CONFIRMED )) && echo "  当前 SSH 来源 IP: ${SSH_PEERS[*]:-未检测到}"
+  # 本次不执行 UFW 模块, 但机器上 UFW 在运行: 列出会顺带做的防火墙改动
+  if [[ $ENABLE_UFW != yes ]] && ufw_active; then
+    [[ $ENABLE_SSH == yes ]]    && echo "  UFW 已在运行: 将放行 SSH 新端口 ${SSH_PORT}/tcp (白名单 ${SSH_ALLOW_IPS:-无(任意 IP)})"
+    [[ $ENABLE_DOCKER == yes ]] && echo "  UFW 已在运行: 将写入 Docker 端口接管规则 (${UFW_AFTER_RULES}) 并 reload"
+  fi
   [[ $ENABLE_BASELINE == yes ]] && echo "  时区: ${TIMEZONE}, journald 上限: ${JOURNALD_MAX_USE}"
   [[ $ENABLE_PACKAGES == yes ]] && echo "  软件包档位: ${PACKAGE_PROFILE} ${EXTRA_PACKAGES:+(额外: ${EXTRA_PACKAGES})}"
   if [[ -n ${NEW_USER:-} ]]; then
@@ -1393,8 +1500,6 @@ show_plan() {
     echo "  网络: 拥塞控制 ${TCP_CONGESTION}, qdisc ${TCP_QDISC}, TCP 窗口上限 ${TCP_WINDOW_DESC}"
     [[ -n ${TCP_BANDWIDTH_SRC:-} ]] && echo "       带宽: ${TCP_BANDWIDTH_SRC}"
     [[ -n ${TCP_RTT_SRC:-} ]] && echo "       延迟: ${TCP_RTT_SRC}"
-  else
-    echo "  网络优化 (BBR + fq + TCP 窗口): 关闭"
   fi
   if [[ $ENABLE_SHELL_ENV == yes ]]; then
     echo "  环境优化: $( [[ $SHELL_ENV_SCOPE == global ]] && echo '全部用户(含 root)' || echo "${SHELL_ENV_USERS}")"
@@ -1683,13 +1788,19 @@ check_sshd_include() {
 
 save_state() {
   local k content
+  # 状态文件里的 ENABLE_UFW / ENABLE_FAIL2BAN 表示"这台机器上 UFW / fail2ban 是否在管",
+  # 供 --ssh-lockdown 用; 单独执行 ssh 模块时本次没跑这两个模块, 但它们可能早已启用,
+  # 不能照搬本次的模块开关把它们写成 no
+  local ufw_state=${ENABLE_UFW:-no} f2b_state=${ENABLE_FAIL2BAN:-no}
+  [[ $ufw_state == yes ]] || ! ufw_active || ufw_state=yes
+  [[ $f2b_state == yes ]] || [[ ! -f $F2B_JAIL ]] || f2b_state=yes
   content=$(
     # 不写时间戳: 内容不变时 write_file 不重写, 重复执行不产生多余备份 (时间见 summary.txt)
     echo "# server-init state"
-    for k in NEW_USER SSH_PORT SSH_ALLOW_IPS SSH_CLIENT_ALIVE_INTERVAL SSH_CLIENT_ALIVE_COUNT_MAX \
-             ENABLE_UFW ENABLE_FAIL2BAN SSH_LOCKED; do
+    for k in NEW_USER SSH_PORT SSH_ALLOW_IPS SSH_CLIENT_ALIVE_INTERVAL SSH_CLIENT_ALIVE_COUNT_MAX SSH_LOCKED; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
+    printf 'ENABLE_UFW=%q\nENABLE_FAIL2BAN=%q\n' "$ufw_state" "$f2b_state"
     printf 'CUR_SSH_PORTS=%q\n' "${CUR_SSH_PORTS[*]}"
   )
   write_file "$STATE_FILE" 600 <<<"$content" || true
@@ -1718,6 +1829,18 @@ do_ssh() {
       ;;
   esac
   SSH_LOCKED=$( [[ $stage == locked ]] && echo yes || echo no )
+
+  # 本次没跑 UFW / fail2ban 模块 (单独执行 ssh), 但它们已在运行: 先放行新端口, 否则
+  # 验证登录会被拦; fail2ban 同时监控新旧端口, 锁定时再收紧为只剩新端口
+  if [[ $ENABLE_UFW != yes ]] && ufw_active; then
+    ufw_allow_ssh_port "$SSH_PORT" "server-init ssh"
+    ok "UFW 已放行 ${SSH_PORT}/tcp (白名单 ${SSH_ALLOW_IPS:-无(任意 IP)})"
+  fi
+  if [[ $ENABLE_FAIL2BAN != yes && -f $F2B_JAIL ]]; then
+    f2b_set_ports "$(printf '%s\n' "$SSH_PORT" "${CUR_SSH_PORTS[@]}" | sort -un | paste -sd, -)" \
+      || warn "fail2ban 端口更新失败, 请检查 ${F2B_JAIL}"
+  fi
+
   write_sshd_dropin "$stage"
 
   if ! "$(sshd_bin)" -t || ! verify_sshd_effective "$stage"; then
@@ -1830,7 +1953,7 @@ do_ufw() {
 
 write_f2b_jail() {
   local ports=$1 banaction ignore="127.0.0.1/8 ::1 ${SSH_ALLOW_IPS:-}"
-  if command -v ufw >/dev/null && [[ $(ufw status 2>/dev/null) == *"Status: active"* ]]; then
+  if ufw_active; then
     banaction=ufw
   else
     banaction=nftables-multiport
@@ -1933,8 +2056,13 @@ EOF
     usermod -aG docker "$NEW_USER"
     ok "${NEW_USER} 已加入 docker 组 (重新登录后生效)"
   fi
-  # docker 启动会重建 DOCKER-USER 链, reload 一次让 UFW 规则生效
-  if [[ $ENABLE_UFW == yes ]]; then ufw reload >/dev/null; fi
+  # UFW 已启用时确保接管规则存在: 单独补装 docker 时 do_ufw 不会跑, 没有这段规则容器端口
+  # 会直接暴露 (本次跑了 UFW 模块的话 do_ufw 已写过)。docker 启动会重建 DOCKER-USER 链,
+  # reload 一次让规则生效
+  if ufw_active; then
+    [[ $ENABLE_UFW == yes ]] || write_ufw_docker_rules
+    ufw reload >/dev/null
+  fi
   ok "Docker: $(docker --version)"
   note "Docker: 容器端口默认不对公网开放, 放行用: ufw route allow proto tcp from any to any port <容器端口>"
 }
@@ -2361,14 +2489,13 @@ ssh_lockdown() {
   done
 
   # sshd 已确认只在新端口工作, 此时再关 UFW 旧端口
-  if [[ ${ENABLE_UFW:-no} == yes ]] && command -v ufw >/dev/null; then
+  if ufw_active; then
     for p in $old; do ufw_delete_ssh_port "$p"; done
     if [[ -n $old ]]; then ok "UFW 已关闭旧 SSH 端口: ${old}"; fi
   fi
 
   if [[ -f $F2B_JAIL ]]; then
-    if sed -i -E "s/^port[[:space:]]*=.*/port    = ${SSH_PORT}/" "$F2B_JAIL" \
-      && { systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban; }; then
+    if f2b_set_ports "$SSH_PORT"; then
       ok "fail2ban 已更新为只监控端口 ${SSH_PORT}"
     else
       warn "fail2ban 端口更新失败, 请检查 ${F2B_JAIL} 和 journalctl -u fail2ban"
@@ -2541,13 +2668,22 @@ usage() {
 server-init v${SCRIPT_VERSION} - Debian 12/13, Ubuntu 22.04/24.04/26.04 初始化
 
 用法:
-  sudo bash init.sh [选项]
-  curl -fsSL <raw-url>/init.sh | sudo bash -s -- [选项]
+  sudo bash init.sh [选项] [模块...]
+  curl -fsSL <raw-url>/init.sh | sudo bash -s -- [选项] [模块...]
+
+模块:
+  不带模块参数时按菜单 / 配置决定执行哪些模块 (默认除网络优化外全部执行)。
+  带上模块名则只执行这些模块, 可作为工具单独使用, 例如:
+    sudo bash init.sh docker              交互式安装 Docker
+    sudo bash init.sh -n swap             按默认值直接加 swap
+    sudo bash init.sh -c init.env docker ufw
+  -l, --list 查看全部模块名
 
 选项:
   -c, --config FILE       本地配置文件 (KEY=VALUE, 参考 init.env.example)
   -u, --config-url URL    远程配置文件 (仅 https)
   -n, --non-interactive   非交互模式 (缺失参数用默认值或报错)
+  -l, --list              列出可用模块名
       --ssh-lockdown      仅执行 SSH 锁定 (之前跳过时补做)
   -h, --help              显示帮助
 
@@ -2563,10 +2699,19 @@ parse_args() {
       -u|--config-url)      CLI_CONFIG_URL=${2:?--config-url 需要参数}; shift 2 ;;
       -n|--non-interactive) NONINTERACTIVE=yes; shift ;;
       --ssh-lockdown)       MODE=lockdown; shift ;;
+      -l|--list)            list_modules; exit 0 ;;
       -h|--help)            usage; exit 0 ;;
-      *) usage >&2; die "未知参数: $1" ;;
+      -*) usage >&2; die "未知参数: $1" ;;
+      *)
+        local key
+        key=$(module_key_for_name "$1") || { list_modules >&2; die "未知模块: $1"; }
+        ONLY_MODULES+=("$key")
+        shift ;;
     esac
   done
+  if [[ $MODE == lockdown ]] && (( ${#ONLY_MODULES[@]} )); then
+    die "--ssh-lockdown 不能和模块名同时使用"
+  fi
 }
 
 main() {
@@ -2582,11 +2727,9 @@ main() {
   check_os
   decide_interactive
   detect_ssh_ports
-  # 先确认来源 IP, 再做后面的一切: 完整模式用它做白名单默认值 / 自动加白,
-  # --ssh-lockdown 用它检查关旧端口后自己是否还能登录
-  confirm_ssh_peer
-
   if [[ $MODE == lockdown ]]; then
+    # --ssh-lockdown 用来源 IP 检查关旧端口后自己是否还能登录
+    confirm_ssh_peer
     run_lockdown_only
     return
   fi
@@ -2596,7 +2739,11 @@ main() {
   fi
 
   select_modules
-  select_net
+  # 来源 IP 只在涉及 SSH / 防火墙 / fail2ban 时才需要 (白名单默认值 / 自动加白 / 防锁死检查)。
+  # 只装 docker、加 swap 这类操作不问, 需要时 ssh_peer_ips 会现场检测
+  if [[ $ENABLE_SSH == yes || $ENABLE_UFW == yes || $ENABLE_FAIL2BAN == yes ]]; then
+    confirm_ssh_peer
+  fi
   collect_baseline
   collect_packages
   collect_user
